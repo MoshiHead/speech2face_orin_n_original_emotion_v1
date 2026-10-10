@@ -360,6 +360,7 @@ class FullCtx:
 
     @torch.no_grad()
     def render(self, motion):
+        motion = motion.to(device=self.g_r.device, dtype=self.ref_x.dtype)
         n = motion.shape[0]
         g = self.g_r.expand(n, -1)
         m_r = tuple(m.expand(n, -1, -1, -1) for m in self.m_r)
@@ -368,7 +369,7 @@ class FullCtx:
         return self.r.decode(m_c, m_r, f_r).float().clamp(0, 1)
 
 
-def invert_latents(D, targets, init, iters=240, lr=0.05, chunk=8, reg=1e-3, tag=""):
+def invert_latents(D, targets, init, iters=240, lr=0.05, chunk=4, reg=1e-3, tag=""):
     """Find the 32-D codes whose NARROW render best matches `targets`.
 
     This is the fallback when weights/renderer.ckpt (the full IMTalker
@@ -388,36 +389,51 @@ def invert_latents(D, targets, init, iters=240, lr=0.05, chunk=8, reg=1e-3, tag=
     targets: [N,3,512,512] in [0,1] on `device`.  init: [32] starting code.
     Returns (codes [N,32], per-target final L1 residual [N]).
     """
-    dt = next(D.parameters()).dtype
+    dev = next(D.parameters()).device
+    orig_dtype = next(D.parameters()).dtype
+    # Optimise in fp32 even when the renderer was loaded as fp16: half-precision
+    # gradients underflow and the inversion converges to a visibly worse fit.
+    # The requested dtype is restored before the sweep, which still renders in it.
+    if orig_dtype != torch.float32:
+        D.float()
+    dt = torch.float32
+    # `init` arrives on the CPU (motion_mean / an earlier inverted code) while D
+    # lives on the GPU, so it must be moved or every forward raises a
+    # device-mismatch inside DistilledRenderer.forward.
+    init = init.detach().to(device=dev, dtype=dt).view(1, -1)
     bl = int(getattr(D.cfg, "blink_len", 0) or 0)
     out_codes, out_res = [], []
     n_total = targets.shape[0]
-    for s in range(0, n_total, chunk):
-        tgt = targets[s:s + chunk].to(dtype=dt)
-        n = tgt.shape[0]
-        m = init.view(1, -1).repeat(n, 1).clone().to(dtype=torch.float32)
-        m.requires_grad_(True)
-        opt = torch.optim.Adam([m], lr=lr)
-        ph = None
-        if bl > 0:
-            # phase 0 for every target: we are matching a mean/median face, and
-            # the blink table is a separate additive term we do not want to fit.
-            ph = torch.zeros(n, dtype=torch.long, device=tgt.device)
-        for it in range(iters):
-            opt.zero_grad(set_to_none=True)
-            img = D(m.to(dtype=dt), ph) if bl > 0 else D(m.to(dtype=dt))
-            loss = (img.float() - tgt.float()).abs().mean()
-            loss = loss + reg * (m - init.view(1, -1)).pow(2).mean()
-            loss.backward()
-            opt.step()
-        with torch.no_grad():
-            img = D(m.to(dtype=dt), ph) if bl > 0 else D(m.to(dtype=dt))
-            res = (img.float() - tgt.float()).abs().mean(dim=(1, 2, 3))
-        out_codes.append(m.detach().float().cpu())
-        out_res.append(res.float().cpu())
-        print("[stage0]   invert%s %d/%d  mean L1 residual=%.5f" % (
-            (" " + tag) if tag else "", min(s + chunk, n_total), n_total,
-            float(res.mean())))
+    try:
+        for s in range(0, n_total, chunk):
+            tgt = targets[s:s + chunk].to(device=dev, dtype=dt)
+            n = tgt.shape[0]
+            m = init.repeat(n, 1).clone()
+            m.requires_grad_(True)
+            opt = torch.optim.Adam([m], lr=lr)
+            ph = None
+            if bl > 0:
+                # phase 0 for every target: we are matching a mean/median face,
+                # and blink is a separate additive term we do not want to fit.
+                ph = torch.zeros(n, dtype=torch.long, device=dev)
+            for _it in range(iters):
+                opt.zero_grad(set_to_none=True)
+                img = D(m, ph) if bl > 0 else D(m)
+                loss = (img.float() - tgt).abs().mean() \
+                    + reg * (m - init).pow(2).mean()
+                loss.backward()
+                opt.step()
+            with torch.no_grad():
+                img = D(m, ph) if bl > 0 else D(m)
+                res = (img.float() - tgt).abs().mean(dim=(1, 2, 3))
+            out_codes.append(m.detach().float().cpu())
+            out_res.append(res.float().cpu())
+            print("[stage0]   invert%s %d/%d  mean L1 residual=%.5f" % (
+                (" " + tag) if tag else "", min(s + chunk, n_total), n_total,
+                float(res.mean())))
+    finally:
+        if orig_dtype != torch.float32:
+            D.to(dtype=orig_dtype)
     return torch.cat(out_codes, 0), torch.cat(out_res, 0)
 
 
@@ -426,13 +442,16 @@ def render_narrow(D, motion, phase0=0, chunk=8):
     """Chunked: the decoder's 256-channel stack at 256x256 is ~8 MB/frame of
     activations, so a 193-frame trajectory rendered in one batch would need
     well over 10 GB. Chunking keeps peak memory flat."""
-    dt = next(D.parameters()).dtype
+    p0 = next(D.parameters())
+    dt, dev = p0.dtype, p0.device
     bl = int(getattr(D.cfg, "blink_len", 0) or 0)
     outs = []
     for i in range(0, motion.shape[0], chunk):
-        mo = motion[i:i + chunk].to(dtype=dt)
+        # normalise device as well as dtype: latents are kept on the CPU between
+        # stages, and a CPU motion tensor here would fault inside the renderer.
+        mo = motion[i:i + chunk].to(device=dev, dtype=dt)
         if bl > 0:
-            ph = (torch.arange(mo.shape[0], device=mo.device) + phase0 + i) % bl
+            ph = (torch.arange(mo.shape[0], device=dev) + phase0 + i) % bl
             img = D(mo, ph)
         else:
             img = D(mo)
